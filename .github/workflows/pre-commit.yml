@@ -1,48 +1,114 @@
-# SPDX-FileCopyrightText: Copyright (c) 2019 Anthony Sottile
-#
-# SPDX-License-Identifier: MIT
-
-name: pre-commit
+name: Build Custom CircuitPython Firmware
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      circuitpython_version:
+        description: 'CircuitPython Version (e.g., 9.2.8)'
+        required: true
+        default: '9.2.8'
+      board_name:
+        description: 'Target Board Name (e.g., yellobyte_yd_esp_s3_n16r8v)'
+        required: true
+        default: 'yellobyte_yd_esp32_s3_n16r8v'
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  push:
+    branches:
+      - main # Or your preferred branch
 
 jobs:
-  pre-commit:
-    runs-on: ubuntu-24.04
+  build_firmware:
+    runs-on: ubuntu-latest
+    # Using a recent ESP-IDF Docker image as a base environment.
+    # The submodule scripts will install/configure the specific IDF version.
+    container:
+      image: espressif/idf:v5.1.2 # Or a later compatible version like v5.2.1, v5.3.1
+
     steps:
-    - name: Set up repository
+    - name: Checkout CircuitPython Fork
       uses: actions/checkout@v4
       with:
-        submodules: false
-        show-progress: false
-        fetch-depth: 1
-        persist-credentials: false
-    - name: Set up python
-      uses: actions/setup-python@v5
-      with:
-        python-version: 3.x
-    - name: Set up submodules
-      uses: ./.github/actions/deps/submodules
-    - name: Set up external
-      uses: ./.github/actions/deps/external
-    - name: Install dependencies
+        repository: ${{ github.repository }}
+        submodules: 'false' # We'll handle submodules after checking out the specific tag
+
+    - name: Get CircuitPython Version from Input or Default
+      id: cp_version
+      run: echo "version=${{ github.event.inputs.circuitpython_version || '9.2.8' }}" >> $GITHUB_OUTPUT
+
+    - name: Get Board Name from Input or Default
+      id: board_info
+      run: echo "name=${{ github.event.inputs.board_name || 'yellobyte_yd_esp32_s3_n16r8v' }}" >> $GITHUB_OUTPUT
+
+    - name: Checkout Specific CircuitPython Version Tag & Update Submodules
+      working-directory: ${{ github.workspace }}
       run: |
-        sudo apt-get update
-        sudo apt-get install -y gettext
-    - name: Run pre-commit
-      uses: pre-commit/action@v3.0.1
-    - name: Make patch
-      if: failure()
-      run: git diff > ~/pre-commit.patch
-    - name: Upload patch
-      if: failure()
+        git fetch --all --tags --depth=100 # Fetch tags
+        echo "Checking out tag: ${{ steps.cp_version.outputs.version }}"
+        git checkout ${{ steps.cp_version.outputs.version }}
+        echo "Updating submodules (this may take a while)..."
+        git submodule update --init --recursive # This pulls the pinned ESP-IDF version
+
+    - name: Install CircuitPython's Python Build Dependencies
+      working-directory: ${{ github.workspace }}
+      run: |
+        pip install --upgrade pip
+        # Path to requirements might vary slightly by CP version, adjust if needed
+        if [ -f "tools/requirements-build.txt" ]; then
+          pip install -r tools/requirements-build.txt
+        elif [ -f "requirements-build.txt" ]; then
+          pip install -r requirements-build.txt
+        else
+          echo "WARNING: Build requirements file not found. Attempting to install common ones."
+          # Fallback, less ideal. Check your CP version's actual requirements.
+          pip install wheel setuptools pyserial click Adafruit-Blinka adafruit-circuitpython-typing
+        fi
+        # Ensure 'make' can find 'mpy-cross' by adding it to PATH if it's built in 'mpy-cross/'
+        # This typically happens during the make process if needed.
+        # If mpy-cross is pre-built and needs to be in PATH explicitly for some reason:
+        # export PATH=$PATH:${{ github.workspace }}/mpy-cross
+
+    # --- IMPORTANT ---
+    # PREFERRED: Commit your 'mpconfigboard.mk' change directly to your fork.
+    # If committed, REMOVE or COMMENT OUT this 'Modify mpconfigboard.mk' step.
+    - name: Modify mpconfigboard.mk for I2SIn (if not already committed)
+      working-directory: ${{ github.workspace }}
+      run: |
+        BOARD_CONFIG_PATH="ports/espressif/boards/${{ steps.board_info.outputs.name }}/mpconfigboard.mk"
+        if [ -f "$BOARD_CONFIG_PATH" ]; then
+          echo "Modifying $BOARD_CONFIG_PATH to enable I2SIn..."
+          sed -i 's/^\(CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*\)0/\11/' "$BOARD_CONFIG_PATH"
+          echo "Contents after modification:"
+          cat "$BOARD_CONFIG_PATH"
+        else
+          echo "ERROR: Board config file $BOARD_CONFIG_PATH not found!"
+          exit 1
+        fi
+
+    - name: Install ESP-IDF Toolchain via Submodule Script
+      working-directory: ${{ github.workspace }}/ports/espressif
+      run: |
+        echo "Installing ESP-IDF tools for target esp32s3 using submodule's install.sh..."
+        # The ./esp-idf/ directory is from the submodule update.
+        # Pass specific targets like 'esp32s3' to speed up installation.
+        # Add other targets if needed: ./esp-idf/install.sh esp32s3 esp32c3 etc.
+        ./esp-idf/install.sh esp32s3
+
+    - name: Build Firmware
+      working-directory: ${{ github.workspace }}/ports/espressif
+      run: |
+        echo "Sourcing ESP-IDF environment and building for board: ${{ steps.board_info.outputs.name }}"
+        # Source the export.sh from the submodule to set up paths correctly
+        # and then run make in the same shell context.
+        source ./esp-idf/export.sh
+        make BOARD=${{ steps.board_info.outputs.name }} -j$(nproc)
+
+    - name: Upload Firmware Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: patch
-        path: ~/pre-commit.patch
+        name: firmware-${{ steps.board_info.outputs.name }}-${{ steps.cp_version.outputs.version }}
+        path: |
+          ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/bootloader/bootloader.bin
+          ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/partition_table/partition-table.bin
+          ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/circuitpython.bin
+          ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/*.uf2
+        if-no-files-found: warn # Options: 'error', 'warn', 'ignore'
