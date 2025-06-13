@@ -23,6 +23,25 @@ jobs:
       image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1
 
     steps:
+    - name: Set Git Safe Directory & Checkout CircuitPython Fork
+      # Run the safe.directory command here, before actions/checkout does its work.
+      # This is done by adding a pre-script to the action.
+      # However, actions/checkout doesn't directly support a pre-script in this way.
+      # So, we'll do it in a separate step right before.
+      run: |
+        echo "Marking ${GITHUB_WORKSPACE} as a safe Git directory..."
+        # The GITHUB_WORKSPACE might not be populated yet in this very first step if run separately.
+        # So we use the known path structure for the runner.
+        # The workspace is typically /__w/reponame/reponame
+        # Let's find the repo name dynamically
+        REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+        WORKSPACE_PATH="/__w/${REPO_NAME}/${REPO_NAME}"
+        echo "Calculated workspace path: ${WORKSPACE_PATH}"
+        git config --global --add safe.directory "${WORKSPACE_PATH}"
+      # This step above might still be too late for actions/checkout itself.
+      # A more robust way is to ensure the runner user has permissions, or use a container where this is not an issue.
+      # For now, let's keep the safe.directory in the script block below as well.
+
     - name: Checkout CircuitPython Fork & Fetch All Tags
       uses: actions/checkout@v4
       with:
@@ -38,27 +57,37 @@ jobs:
       id: board_info
       run: echo "name=${{ github.event.inputs.board_name || 'yd_esp32_s3_n16r8' }}" >> $GITHUB_OUTPUT
 
-    - name: Set Git Safe Directory and Checkout Specific Version
+    - name: Checkout Specific Version & Update Submodules
       working-directory: ${{ github.workspace }}
       run: |
-        # Add the current directory to Git's safe directories
-        echo "Marking ${GITHUB_WORKSPACE} as a safe Git directory..."
-        git config --global --add safe.directory ${GITHUB_WORKSPACE}
+        # Ensure safe directory for this script's git operations
+        echo "Re-confirming ${GITHUB_WORKSPACE} as a safe Git directory for this step..."
+        git config --global --add safe.directory "${GITHUB_WORKSPACE}"
         
-        # Double-check fetching all tags (actions/checkout with fetch-depth: 0 should have done this)
-        echo "Fetching all tags (again, just in case)..."
+        echo "Available tags (first 20 before explicit fetch):"
+        git tag | sort -V | tail -n 20 # List some tags for debugging, sorted
+
+        echo "Fetching all tags (again, to be absolutely sure)..."
         git fetch --all --tags --prune --force 
         
-        echo "Available tags (first 20 after fetch):"
-        git tag | head -n 20 # List some tags for debugging
+        echo "Available tags (first 20 after explicit fetch):"
+        git tag | sort -V | tail -n 20 # List some tags for debugging, sorted
 
         echo "Checking out tag: ${{ steps.cp_version.outputs.version }}"
-        # Checkout the tag into a temporary local branch
-        git checkout tags/${{ steps.cp_version.outputs.version }} -b temp-branch-for-build 
+        # Try a more direct checkout of the tag. If it's an annotated tag, this might need adjustment.
+        # Using 'git checkout tags/TAG_NAME' is often more robust for annotated tags.
+        if git rev-parse --verify --quiet "refs/tags/${{ steps.cp_version.outputs.version }}"; then
+          git checkout "tags/${{ steps.cp_version.outputs.version }}"
+        else
+          echo "Tag ${{ steps.cp_version.outputs.version }} not found directly, trying without 'tags/' prefix"
+          git checkout "${{ steps.cp_version.outputs.version }}"
+        fi
         
         echo "Updating submodules (this may take a while)..."
         git submodule update --init --recursive
 
+    # ... (Rest of your workflow: Install Python Deps, Modify mpconfigboard.mk, etc.) ...
+    # (The rest of the YML from the previous "full updated workflow" message should follow here)
     - name: Install CircuitPython's Python Build Dependencies
       working-directory: ${{ github.workspace }}
       run: |
@@ -71,10 +100,6 @@ jobs:
           echo "WARNING: Build requirements file not found."
         fi
 
-    # --- IMPORTANT ---
-    # IF YOU HAVE ALREADY COMMITTED YOUR 'mpconfigboard.mk' CHANGE 
-    # (CIRCUITPY_AUDIOBUSIO_I2S_IN = 1) TO YOUR FORK,
-    # THEN REMOVE OR COMMENT OUT THIS NEXT "Modify mpconfigboard.mk" STEP.
     - name: Modify mpconfigboard.mk for I2SIn (if not already committed)
       working-directory: ${{ github.workspace }}
       run: |
