@@ -24,35 +24,27 @@ jobs:
 
     steps:
     - name: Free up disk space on runner
-      # This step runs on the runner itself, before the container fully takes over for subsequent script steps
-      # but commands inside 'container' run inside the container.
-      # For commands to affect the runner HOST, they should ideally be outside a container context if possible,
-      # or you need to be aware of what 'sudo rm -rf' targets within the container vs. the host.
-      # However, let's try it here. The Docker container itself might have limited overlay space.
       run: |
         echo "Attempting to free up disk space..."
         echo "Initial disk space:"
         df -h
-        # Commands below will run INSIDE the container if the job uses a container.
-        # If these paths don't exist in the container, they won't do much.
-        # The space issue might be related to the Docker image overlay size limit.
         sudo rm -rf /usr/local/lib/android || echo "Android SDK not found or removal failed"
         sudo rm -rf /usr/share/dotnet || echo ".NET SDK not found or removal failed"
         sudo rm -rf /opt/ghc || echo "GHC not found or removal failed"
-        # The ESP-IDF container is usually lean, so these might not exist:
-        # sudo rm -rf /opt/hostedtoolcache 
+        # Adding a few more common large directories from the GitHub runner images
+        sudo rm -rf /opt/hostedtoolcache || echo "/opt/hostedtoolcache removal failed"
+        sudo rm -rf "/usr/local/share/boost" || echo "/usr/local/share/boost removal failed"
         sudo apt-get clean || echo "apt-get clean failed"
         echo "Disk space after cleanup attempts:"
         df -h
-      # Continue even if some rm commands fail (e.g., directory not found)
-      continue-on-error: true 
+      continue-on-error: true
 
     - name: Checkout CircuitPython Fork
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.repository }}
-        fetch-depth: 0 
-        submodules: 'false'
+        repository: ${{ github.repository }} # This will checkout your fork where the workflow runs
+        fetch-depth: 0
+        submodules: 'false' # We will handle submodules manually
 
     - name: Get CircuitPython Version from Input or Default
       id: cp_version
@@ -62,7 +54,7 @@ jobs:
       id: board_info
       run: echo "name=${{ github.event.inputs.board_name || 'yd_esp32_s3_n16r8' }}" >> $GITHUB_OUTPUT
 
-    - name: Fetch Upstream Tags, Checkout Specific Version & Update Submodules
+    - name: Fetch Upstream Tags, Checkout Specific Version & Update Selective Submodules
       working-directory: ${{ github.workspace }}
       run: |
         echo "Configuring Git safe directory..."
@@ -72,15 +64,16 @@ jobs:
         git remote add upstream https://github.com/adafruit/circuitpython.git
         
         echo "Fetching all tags from upstream (adafruit/circuitpython)..."
-        git fetch upstream --tags --prune --force 
+        git fetch upstream --tags --prune --force
         
         echo "--- All available local tags after fetching upstream (sorted, last 50) ---"
-        git tag | sort -V | tail -n 50 
+        git tag | sort -V | tail -n 50
         echo "--- End of tag list ---"
 
         echo "Attempting to checkout tag: ${{ steps.cp_version.outputs.version }}"
         CP_TAG_TO_CHECKOUT="${{ steps.cp_version.outputs.version }}"
         
+        # Checkout the desired CircuitPython tag to a new branch
         if git checkout "tags/$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
           echo "Successfully checked out tags/$CP_TAG_TO_CHECKOUT to new branch temp-build-branch"
         elif git checkout "$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
@@ -93,31 +86,55 @@ jobs:
           exit 1
         fi
         
-        echo "Updating submodules (this may take a while)..."
-        # This is where "No space left on device" was happening
-        git submodule update --init --recursive
+        echo "Updating selective submodules (this may take a while)..."
+        # This is the crucial change: update only necessary submodules for an ESP32 build
+        # Based on the successful run, but with corrected spacing.
+        # Add or remove submodules here if your build has specific needs.
+        git submodule update --init --recursive \
+          lib/tinyusb \
+          extmod/ulab \
+          frozen/Adafruit_CircuitPython_BusDevice \
+          frozen/Adafruit_CircuitPython_Register \
+          frozen/Adafruit_CircuitPython_NeoPixel \
+          frozen/Adafruit_CircuitPython_DotStar \
+          frozen/Adafruit_CircuitPython_Display_Text \
+          frozen/Adafruit_CircuitPython_ImageLoad \
+          frozen/Adafruit_CircuitPython_Display_Shapes \
+          frozen/Adafruit_CircuitPython_DisplayIO_SSD1306 \
+          ports/espressif/esp-idf \
+          lib/certificates # Often needed for networking
 
     - name: Install CircuitPython's Python Build Dependencies
-      # ... (rest of the YML from previous correct version) ...
       working-directory: ${{ github.workspace }}
       run: |
         pip install --upgrade pip
         if [ -f "tools/requirements-build.txt" ]; then
           pip install -r tools/requirements-build.txt
-        elif [ -f "requirements-build.txt" ]; then
+        elif [ -f "requirements-build.txt" ]; then # Fallback for older CP versions if path changed
           pip install -r requirements-build.txt
         else
-          echo "WARNING: Build requirements file not found."
+          echo "WARNING: Build requirements file not found at standard locations."
         fi
 
-    - name: Modify mpconfigboard.mk for I2SIn (if not already committed)
+    - name: Modify mpconfigboard.mk for I2SIn (Your one-line change)
       working-directory: ${{ github.workspace }}
       run: |
         BOARD_CONFIG_PATH="ports/espressif/boards/${{ steps.board_info.outputs.name }}/mpconfigboard.mk"
         if [ -f "$BOARD_CONFIG_PATH" ]; then
-          echo "Modifying $BOARD_CONFIG_PATH to enable I2SIn..."
-          sed -i 's/^\(CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*\)0/\11/' "$BOARD_CONFIG_PATH"
-          echo "Contents after modification:"
+          echo "Modifying $BOARD_CONFIG_PATH to enable CIRCUITPY_AUDIOBUSIO_I2S_IN..."
+          # Ensure the line exists before trying to change it from 0 to 1
+          if grep -q "CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*0" "$BOARD_CONFIG_PATH"; then
+            sed -i 's/^\(CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*\)0/\11/' "$BOARD_CONFIG_PATH"
+            echo "CIRCUITPY_AUDIOBUSIO_I2S_IN enabled."
+          elif grep -q "CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*1" "$BOARD_CONFIG_PATH"; then
+            echo "CIRCUITPY_AUDIOBUSIO_I2S_IN already enabled."
+          else
+            echo "WARNING: CIRCUITPY_AUDIOBUSIO_I2S_IN setting not found in the expected format in $BOARD_CONFIG_PATH. It might need to be added manually or is already handled."
+            # Optionally, append it if it's completely missing, though this is less safe:
+            # echo "CIRCUITPY_AUDIOBUSIO_I2S_IN = 1" >> "$BOARD_CONFIG_PATH"
+            # echo "Appended CIRCUITPY_AUDIOBUSIO_I2S_IN = 1"
+          fi
+          echo "Contents of $BOARD_CONFIG_PATH after modification attempt:"
           cat "$BOARD_CONFIG_PATH"
         else
           echo "ERROR: Board config file $BOARD_CONFIG_PATH not found!"
@@ -128,7 +145,8 @@ jobs:
       working-directory: ${{ github.workspace }}/ports/espressif
       run: |
         echo "Installing ESP-IDF tools for target esp32s3 using submodule's install.sh..."
-        ./esp-idf/install.sh esp32s3
+        # The esp-idf submodule should now be populated by the selective update
+        ./esp-idf/install.sh esp32s3 # Specify all targets you might need, or list them
 
     - name: Build Firmware
       working-directory: ${{ github.workspace }}/ports/espressif
