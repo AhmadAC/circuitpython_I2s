@@ -14,21 +14,45 @@ on:
 
   push:
     branches:
-      - main # Or your preferred branch
+      - main
 
 jobs:
   build_firmware:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1 (consider checking CP docs for compatibility with 9.2.8)
+      image: espressif/idf:v5.1.2 # Using this as a base for IDF tools
 
     steps:
-    - name: Checkout CircuitPython Fork & Prepare for Tag Fetching
+    - name: Free up disk space on runner
+      # This step runs on the runner itself, before the container fully takes over for subsequent script steps
+      # but commands inside 'container' run inside the container.
+      # For commands to affect the runner HOST, they should ideally be outside a container context if possible,
+      # or you need to be aware of what 'sudo rm -rf' targets within the container vs. the host.
+      # However, let's try it here. The Docker container itself might have limited overlay space.
+      run: |
+        echo "Attempting to free up disk space..."
+        echo "Initial disk space:"
+        df -h
+        # Commands below will run INSIDE the container if the job uses a container.
+        # If these paths don't exist in the container, they won't do much.
+        # The space issue might be related to the Docker image overlay size limit.
+        sudo rm -rf /usr/local/lib/android || echo "Android SDK not found or removal failed"
+        sudo rm -rf /usr/share/dotnet || echo ".NET SDK not found or removal failed"
+        sudo rm -rf /opt/ghc || echo "GHC not found or removal failed"
+        # The ESP-IDF container is usually lean, so these might not exist:
+        # sudo rm -rf /opt/hostedtoolcache 
+        sudo apt-get clean || echo "apt-get clean failed"
+        echo "Disk space after cleanup attempts:"
+        df -h
+      # Continue even if some rm commands fail (e.g., directory not found)
+      continue-on-error: true 
+
+    - name: Checkout CircuitPython Fork
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.repository }} # Checks out YOUR fork
-        fetch-depth: 0 # Fetches all history of your fork. Upstream tags will be fetched explicitly.
-        submodules: 'false' # We'll handle submodules after specific version checkout.
+        repository: ${{ github.repository }}
+        fetch-depth: 0 
+        submodules: 'false'
 
     - name: Get CircuitPython Version from Input or Default
       id: cp_version
@@ -38,7 +62,7 @@ jobs:
       id: board_info
       run: echo "name=${{ github.event.inputs.board_name || 'yd_esp32_s3_n16r8' }}" >> $GITHUB_OUTPUT
 
-    - name: Fetch Tags, Checkout Specific Version & Update Submodules
+    - name: Fetch Upstream Tags, Checkout Specific Version & Update Submodules
       working-directory: ${{ github.workspace }}
       run: |
         echo "Configuring Git safe directory..."
@@ -47,36 +71,34 @@ jobs:
         echo "Adding upstream remote (adafruit/circuitpython)..."
         git remote add upstream https://github.com/adafruit/circuitpython.git
         
-        echo "Fetching tags from origin (your fork) just in case..."
-        git fetch origin --tags --prune --force 
-        
-        echo "Fetching tags from upstream (adafruit/circuitpython)..."
-        # This is the crucial fetch for getting official release tags
+        echo "Fetching all tags from upstream (adafruit/circuitpython)..."
         git fetch upstream --tags --prune --force 
         
-        echo "Available tags (last 20 after all fetches, should include official tags):"
-        git tag | sort -V | tail -n 20 
+        echo "--- All available local tags after fetching upstream (sorted, last 50) ---"
+        git tag | sort -V | tail -n 50 
+        echo "--- End of tag list ---"
 
-        echo "Checking out tag: ${{ steps.cp_version.outputs.version }}"
+        echo "Attempting to checkout tag: ${{ steps.cp_version.outputs.version }}"
         CP_TAG_TO_CHECKOUT="${{ steps.cp_version.outputs.version }}"
         
-        # Try checking out the tag directly first
-        if git checkout "$CP_TAG_TO_CHECKOUT"; then
-          echo "Successfully checked out $CP_TAG_TO_CHECKOUT"
-        # If that fails, try with 'tags/' prefix (more robust for annotated tags)
-        elif git checkout "tags/$CP_TAG_TO_CHECKOUT"; then
-          echo "Successfully checked out tags/$CP_TAG_TO_CHECKOUT"
+        if git checkout "tags/$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
+          echo "Successfully checked out tags/$CP_TAG_TO_CHECKOUT to new branch temp-build-branch"
+        elif git checkout "$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
+           echo "Successfully checked out $CP_TAG_TO_CHECKOUT directly to new branch temp-build-branch (fallback)"
         else
-          echo "ERROR: Could not checkout tag $CP_TAG_TO_CHECKOUT. Please check the 'Available tags' list above."
-          echo "All available tags from local repository:"
+          echo "ERROR: Could not checkout tag $CP_TAG_TO_CHECKOUT."
+          echo "Please examine the tag list above to see if the tag is present and correctly named."
+          echo "All available tags from local repository (after upstream fetch):"
           git tag
           exit 1
         fi
         
         echo "Updating submodules (this may take a while)..."
+        # This is where "No space left on device" was happening
         git submodule update --init --recursive
 
     - name: Install CircuitPython's Python Build Dependencies
+      # ... (rest of the YML from previous correct version) ...
       working-directory: ${{ github.workspace }}
       run: |
         pip install --upgrade pip
@@ -88,10 +110,6 @@ jobs:
           echo "WARNING: Build requirements file not found."
         fi
 
-    # --- IMPORTANT ---
-    # IF YOU HAVE ALREADY COMMITTED YOUR 'mpconfigboard.mk' CHANGE 
-    # (CIRCUITPY_AUDIOBUSIO_I2S_IN = 1) TO YOUR FORK,
-    # THEN REMOVE OR COMMENT OUT THIS NEXT "Modify mpconfigboard.mk" STEP.
     - name: Modify mpconfigboard.mk for I2SIn (if not already committed)
       working-directory: ${{ github.workspace }}
       run: |
@@ -126,5 +144,5 @@ jobs:
         path: |
           ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/bootloader/bootloader.bin
           ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/partition_table/partition-table.bin
-          ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/circuitpython.bin # CORRECTED
+          ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/circuitpython.bin
         if-no-files-found: error
