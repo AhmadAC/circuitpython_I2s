@@ -20,34 +20,16 @@ jobs:
   build_firmware:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1
+      image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1 (check CP docs for compatibility with 9.2.8)
 
     steps:
-    - name: Set Git Safe Directory & Checkout CircuitPython Fork
-      # Run the safe.directory command here, before actions/checkout does its work.
-      # This is done by adding a pre-script to the action.
-      # However, actions/checkout doesn't directly support a pre-script in this way.
-      # So, we'll do it in a separate step right before.
-      run: |
-        echo "Marking ${GITHUB_WORKSPACE} as a safe Git directory..."
-        # The GITHUB_WORKSPACE might not be populated yet in this very first step if run separately.
-        # So we use the known path structure for the runner.
-        # The workspace is typically /__w/reponame/reponame
-        # Let's find the repo name dynamically
-        REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
-        WORKSPACE_PATH="/__w/${REPO_NAME}/${REPO_NAME}"
-        echo "Calculated workspace path: ${WORKSPACE_PATH}"
-        git config --global --add safe.directory "${WORKSPACE_PATH}"
-      # This step above might still be too late for actions/checkout itself.
-      # A more robust way is to ensure the runner user has permissions, or use a container where this is not an issue.
-      # For now, let's keep the safe.directory in the script block below as well.
-
-    - name: Checkout CircuitPython Fork & Fetch All Tags
+    - name: Checkout CircuitPython Fork
       uses: actions/checkout@v4
       with:
         repository: ${{ github.repository }} # Checks out YOUR fork
-        fetch-depth: 0 # Fetches all history and all tags.
-        submodules: 'false' # We will handle submodules after checking out the specific tag
+        fetch-depth: 0 # Fetches all history AND tags of your fork.
+        submodules: 'false' # We'll handle submodules after specific version checkout.
+        # set-safe-directory: true # This is the default and should handle dubious ownership for this step
 
     - name: Get CircuitPython Version from Input or Default
       id: cp_version
@@ -57,37 +39,42 @@ jobs:
       id: board_info
       run: echo "name=${{ github.event.inputs.board_name || 'yd_esp32_s3_n16r8' }}" >> $GITHUB_OUTPUT
 
-    - name: Checkout Specific Version & Update Submodules
+    - name: Fetch Upstream Tags, Checkout Specific Version & Update Submodules
       working-directory: ${{ github.workspace }}
       run: |
-        # Ensure safe directory for this script's git operations
-        echo "Re-confirming ${GITHUB_WORKSPACE} as a safe Git directory for this step..."
+        echo "Configuring Git safe directory for this script's operations..."
+        # This ensures your explicit git commands in this block are fine
         git config --global --add safe.directory "${GITHUB_WORKSPACE}"
         
-        echo "Available tags (first 20 before explicit fetch):"
-        git tag | sort -V | tail -n 20 # List some tags for debugging, sorted
-
-        echo "Fetching all tags (again, to be absolutely sure)..."
-        git fetch --all --tags --prune --force 
+        echo "Adding upstream remote (adafruit/circuitpython)..."
+        git remote add upstream https://github.com/adafruit/circuitpython.git
         
-        echo "Available tags (first 20 after explicit fetch):"
-        git tag | sort -V | tail -n 20 # List some tags for debugging, sorted
+        echo "Fetching all tags from upstream (adafruit/circuitpython)..."
+        # This is the crucial fetch for getting official release tags
+        git fetch upstream --tags --prune --force 
+        
+        echo "--- All available local tags after fetching upstream (sorted, last 50) ---"
+        git tag | sort -V | tail -n 50 
+        echo "--- End of tag list ---"
 
-        echo "Checking out tag: ${{ steps.cp_version.outputs.version }}"
-        # Try a more direct checkout of the tag. If it's an annotated tag, this might need adjustment.
-        # Using 'git checkout tags/TAG_NAME' is often more robust for annotated tags.
-        if git rev-parse --verify --quiet "refs/tags/${{ steps.cp_version.outputs.version }}"; then
-          git checkout "tags/${{ steps.cp_version.outputs.version }}"
+        echo "Attempting to checkout tag: ${{ steps.cp_version.outputs.version }}"
+        CP_TAG_TO_CHECKOUT="${{ steps.cp_version.outputs.version }}"
+        
+        # Try checking out the tag directly. This usually works for both lightweight and annotated tags.
+        # Create a temporary local branch from the tag to avoid detached HEAD.
+        if git checkout "tags/$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
+          echo "Successfully checked out tags/$CP_TAG_TO_CHECKOUT to new branch temp-build-branch"
+        elif git checkout "$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
+          echo "Successfully checked out $CP_TAG_TO_CHECKOUT directly to new branch temp-build-branch"
         else
-          echo "Tag ${{ steps.cp_version.outputs.version }} not found directly, trying without 'tags/' prefix"
-          git checkout "${{ steps.cp_version.outputs.version }}"
+          echo "ERROR: Could not checkout tag $CP_TAG_TO_CHECKOUT."
+          echo "Please examine the tag list above to see if the tag is present and correctly named."
+          exit 1
         fi
         
         echo "Updating submodules (this may take a while)..."
         git submodule update --init --recursive
 
-    # ... (Rest of your workflow: Install Python Deps, Modify mpconfigboard.mk, etc.) ...
-    # (The rest of the YML from the previous "full updated workflow" message should follow here)
     - name: Install CircuitPython's Python Build Dependencies
       working-directory: ${{ github.workspace }}
       run: |
@@ -100,6 +87,10 @@ jobs:
           echo "WARNING: Build requirements file not found."
         fi
 
+    # --- IMPORTANT ---
+    # IF YOU HAVE ALREADY COMMITTED YOUR 'mpconfigboard.mk' CHANGE 
+    # (CIRCUITPY_AUDIOBUSIO_I2S_IN = 1) TO YOUR FORK,
+    # THEN REMOVE OR COMMENT OUT THIS NEXT "Modify mpconfigboard.mk" STEP.
     - name: Modify mpconfigboard.mk for I2SIn (if not already committed)
       working-directory: ${{ github.workspace }}
       run: |
