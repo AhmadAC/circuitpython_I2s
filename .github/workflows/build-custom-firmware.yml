@@ -20,15 +20,15 @@ jobs:
   build_firmware:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1
+      image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1 (consider checking CP docs for compatibility with 9.2.8)
 
     steps:
     - name: Checkout CircuitPython Fork & Prepare for Tag Fetching
       uses: actions/checkout@v4
       with:
         repository: ${{ github.repository }} # Checks out YOUR fork
-        fetch-depth: 0 # Fetches all history of your fork, but not necessarily upstream tags.
-        submodules: 'false'
+        fetch-depth: 0 # Fetches all history of your fork. Upstream tags will be fetched explicitly.
+        submodules: 'false' # We'll handle submodules after specific version checkout.
 
     - name: Get CircuitPython Version from Input or Default
       id: cp_version
@@ -48,7 +48,6 @@ jobs:
         git remote add upstream https://github.com/adafruit/circuitpython.git
         
         echo "Fetching tags from origin (your fork) just in case..."
-        # fetch-depth:0 on checkout should make this somewhat redundant for origin, but won't hurt.
         git fetch origin --tags --prune --force 
         
         echo "Fetching tags from upstream (adafruit/circuitpython)..."
@@ -69,7 +68,6 @@ jobs:
           echo "Successfully checked out tags/$CP_TAG_TO_CHECKOUT"
         else
           echo "ERROR: Could not checkout tag $CP_TAG_TO_CHECKOUT. Please check the 'Available tags' list above."
-          # List all tags if checkout fails, for better debugging
           echo "All available tags from local repository:"
           git tag
           exit 1
@@ -128,6 +126,5 @@ jobs:
         path: |
           ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/bootloader/bootloader.bin
           ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/partition_table/partition-table.bin
-          ${{ github.workspace }}/ports/espressif/build-${{
-steps.board_info.outputs.name }}/circuitpython.bin
+          ${{ github.workspace }}/ports/espressif/build-${{ steps.board_info.outputs.name }}/circuitpython.bin # CORRECTED
         if-no-files-found: error
