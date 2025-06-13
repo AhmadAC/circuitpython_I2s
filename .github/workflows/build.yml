@@ -23,13 +23,13 @@ jobs:
       image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1 (check CP docs for compatibility with 9.2.8)
 
     steps:
-    - name: Checkout CircuitPython Fork
+    - name: Checkout CircuitPython Fork (Full Depth with Tags)
       uses: actions/checkout@v4
       with:
         repository: ${{ github.repository }} # Checks out YOUR fork
-        fetch-depth: 0 # Fetches all history AND tags of your fork.
-        submodules: 'false' # We'll handle submodules after specific version checkout.
-        # set-safe-directory: true # This is the default and should handle dubious ownership for this step
+        fetch-depth: 0 # IMPORTANT: Fetches all history AND tags of your fork.
+        # submodules: 'false' # Default is false, explicit is fine too.
+        # set-safe-directory: true # Default is true, explicit is fine too.
 
     - name: Get CircuitPython Version from Input or Default
       id: cp_version
@@ -38,6 +38,20 @@ jobs:
     - name: Get Board Name from Input or Default
       id: board_info
       run: echo "name=${{ github.event.inputs.board_name || 'yd_esp32_s3_n16r8' }}" >> $GITHUB_OUTPUT
+
+    - name: Free up disk space on Runner
+      run: |
+        echo "Initial disk space:"
+        df -h .
+        # The container might not have all these, but it's safe to try removing
+        sudo rm -rf /usr/share/dotnet || echo "dotnet not found or removal failed"
+        sudo rm -rf /opt/ghc || echo "ghc not found or removal failed"
+        sudo rm -rf "/usr/local/share/boost" || echo "boost not found or removal failed"
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY/CodeQL" || echo "CodeQL not found or removal failed"
+        # Add other large pre-installed tools you don't need if running directly on runner
+        # For container, focus on what might be in the container or mounted
+        echo "Disk space after cleanup attempt:"
+        df -h .
 
     - name: Fetch Upstream Tags, Checkout Specific Version & Update Submodules
       working-directory: ${{ github.workspace }}
@@ -56,19 +70,21 @@ jobs:
         echo "--- All available local tags after fetching upstream (sorted, last 50) ---"
         git tag | sort -V | tail -n 50 
         echo "--- End of tag list ---"
-
         echo "Attempting to checkout tag: ${{ steps.cp_version.outputs.version }}"
         CP_TAG_TO_CHECKOUT="${{ steps.cp_version.outputs.version }}"
         
-        # Try checking out the tag directly. This usually works for both lightweight and annotated tags.
         # Create a temporary local branch from the tag to avoid detached HEAD.
+        # 'git checkout tags/TAG_NAME -b branch_name' is robust.
         if git checkout "tags/$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
           echo "Successfully checked out tags/$CP_TAG_TO_CHECKOUT to new branch temp-build-branch"
         elif git checkout "$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
-          echo "Successfully checked out $CP_TAG_TO_CHECKOUT directly to new branch temp-build-branch"
+           echo "Successfully checked out $CP_TAG_TO_CHECKOUT directly to new branch temp-build-branch (fallback)"
         else
           echo "ERROR: Could not checkout tag $CP_TAG_TO_CHECKOUT."
           echo "Please examine the tag list above to see if the tag is present and correctly named."
+          # List all tags if checkout fails, for better debugging
+          echo "All available tags from local repository (after upstream fetch):"
+          git tag
           exit 1
         fi
         
@@ -109,6 +125,8 @@ jobs:
       working-directory: ${{ github.workspace }}/ports/espressif
       run: |
         echo "Installing ESP-IDF tools for target esp32s3 using submodule's install.sh..."
+        # The esp-idf/install.sh script itself might download more tools.
+        # Ensure the container has enough space for these too.
         ./esp-idf/install.sh esp32s3
 
     - name: Build Firmware
