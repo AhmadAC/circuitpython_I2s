@@ -14,22 +14,36 @@ on:
 
   push:
     branches:
-      - main # Or your preferred branch
+      - main
 
 jobs:
   build_firmware:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.1.2 # Or v5.2.1, v5.3.1 (check CP docs for compatibility with 9.2.8)
+      image: espressif/idf:v5.1.2 # Using this as a base for IDF tools
 
     steps:
-    - name: Checkout CircuitPython Fork (Full Depth with Tags)
+    - name: Free up disk space on runner
+      run: |
+        echo "Attempting to free up disk space..."
+        echo "Initial disk space:"
+        df -h
+        sudo rm -rf /usr/local/lib/android || echo "Android SDK not found or removal failed"
+        sudo rm -rf /usr/share/dotnet || echo ".NET SDK not found or removal failed"
+        sudo rm -rf /opt/ghc || echo "GHC not found or removal failed"
+        sudo rm -rf /opt/hostedtoolcache || echo "/opt/hostedtoolcache removal failed"
+        sudo rm -rf "/usr/local/share/boost" || echo "/usr/local/share/boost removal failed"
+        sudo apt-get clean || echo "apt-get clean failed"
+        echo "Disk space after cleanup attempts:"
+        df -h
+      continue-on-error: true
+
+    - name: Checkout CircuitPython Fork
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.repository }} # Checks out YOUR fork
-        fetch-depth: 0 # IMPORTANT: Fetches all history AND tags of your fork.
-        # submodules: 'false' # Default is false, explicit is fine too.
-        # set-safe-directory: true # Default is true, explicit is fine too.
+        repository: ${{ github.repository }}
+        fetch-depth: 0
+        submodules: 'false' # We will handle submodules manually
 
     - name: Get CircuitPython Version from Input or Default
       id: cp_version
@@ -39,42 +53,25 @@ jobs:
       id: board_info
       run: echo "name=${{ github.event.inputs.board_name || 'yd_esp32_s3_n16r8' }}" >> $GITHUB_OUTPUT
 
-    - name: Free up disk space on Runner
-      run: |
-        echo "Initial disk space:"
-        df -h .
-        # The container might not have all these, but it's safe to try removing
-        sudo rm -rf /usr/share/dotnet || echo "dotnet not found or removal failed"
-        sudo rm -rf /opt/ghc || echo "ghc not found or removal failed"
-        sudo rm -rf "/usr/local/share/boost" || echo "boost not found or removal failed"
-        sudo rm -rf "$AGENT_TOOLSDIRECTORY/CodeQL" || echo "CodeQL not found or removal failed"
-        # Add other large pre-installed tools you don't need if running directly on runner
-        # For container, focus on what might be in the container or mounted
-        echo "Disk space after cleanup attempt:"
-        df -h .
-
-    - name: Fetch Upstream Tags, Checkout Specific Version & Update Submodules
+    - name: Fetch Upstream Tags, Checkout Specific Version & Update Selective Submodules
       working-directory: ${{ github.workspace }}
       run: |
-        echo "Configuring Git safe directory for this script's operations..."
-        # This ensures your explicit git commands in this block are fine
+        echo "Configuring Git safe directory..."
         git config --global --add safe.directory "${GITHUB_WORKSPACE}"
         
         echo "Adding upstream remote (adafruit/circuitpython)..."
         git remote add upstream https://github.com/adafruit/circuitpython.git
         
         echo "Fetching all tags from upstream (adafruit/circuitpython)..."
-        # This is the crucial fetch for getting official release tags
-        git fetch upstream --tags --prune --force 
+        git fetch upstream --tags --prune --force
         
         echo "--- All available local tags after fetching upstream (sorted, last 50) ---"
-        git tag | sort -V | tail -n 50 
+        git tag | sort -V | tail -n 50
         echo "--- End of tag list ---"
+
         echo "Attempting to checkout tag: ${{ steps.cp_version.outputs.version }}"
         CP_TAG_TO_CHECKOUT="${{ steps.cp_version.outputs.version }}"
         
-        # Create a temporary local branch from the tag to avoid detached HEAD.
-        # 'git checkout tags/TAG_NAME -b branch_name' is robust.
         if git checkout "tags/$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
           echo "Successfully checked out tags/$CP_TAG_TO_CHECKOUT to new branch temp-build-branch"
         elif git checkout "$CP_TAG_TO_CHECKOUT" -b temp-build-branch; then
@@ -82,14 +79,32 @@ jobs:
         else
           echo "ERROR: Could not checkout tag $CP_TAG_TO_CHECKOUT."
           echo "Please examine the tag list above to see if the tag is present and correctly named."
-          # List all tags if checkout fails, for better debugging
           echo "All available tags from local repository (after upstream fetch):"
           git tag
           exit 1
         fi
         
-        echo "Updating submodules (this may take a while)..."
-        git submodule update --init --recursive
+        echo "Initializing selective submodules..."
+        # Step 1: Initialize only the necessary submodules
+        # Add or remove submodules here based on your board's specific needs.
+        git submodule init \
+          lib/tinyusb \
+          extmod/ulab \
+          frozen/Adafruit_CircuitPython_BusDevice \
+          frozen/Adafruit_CircuitPython_Register \
+          frozen/Adafruit_CircuitPython_NeoPixel \
+          frozen/Adafruit_CircuitPython_DotStar \
+          frozen/Adafruit_CircuitPython_Display_Text \
+          frozen/Adafruit_CircuitPython_ImageLoad \
+          frozen/Adafruit_CircuitPython_Display_Shapes \
+          frozen/Adafruit_CircuitPython_DisplayIO_SSD1306 \
+          ports/espressif/esp-idf \
+          lib/certificates
+
+        echo "Updating initialized submodules recursively (this may take a while)..."
+        # Step 2: Update only the submodules that were initialized in the previous step.
+        # The --recursive flag will apply to these initialized submodules.
+        git submodule update --recursive
 
     - name: Install CircuitPython's Python Build Dependencies
       working-directory: ${{ github.workspace }}
@@ -97,24 +112,30 @@ jobs:
         pip install --upgrade pip
         if [ -f "tools/requirements-build.txt" ]; then
           pip install -r tools/requirements-build.txt
-        elif [ -f "requirements-build.txt" ]; then
+        elif [ -f "requirements-build.txt" ]; then # Fallback for older CP versions if path changed
           pip install -r requirements-build.txt
         else
-          echo "WARNING: Build requirements file not found."
+          echo "WARNING: Build requirements file not found at standard locations."
         fi
 
-    # --- IMPORTANT ---
-    # IF YOU HAVE ALREADY COMMITTED YOUR 'mpconfigboard.mk' CHANGE 
-    # (CIRCUITPY_AUDIOBUSIO_I2S_IN = 1) TO YOUR FORK,
-    # THEN REMOVE OR COMMENT OUT THIS NEXT "Modify mpconfigboard.mk" STEP.
-    - name: Modify mpconfigboard.mk for I2SIn (if not already committed)
+    - name: Modify mpconfigboard.mk for I2SIn (Your one-line change)
       working-directory: ${{ github.workspace }}
       run: |
         BOARD_CONFIG_PATH="ports/espressif/boards/${{ steps.board_info.outputs.name }}/mpconfigboard.mk"
         if [ -f "$BOARD_CONFIG_PATH" ]; then
-          echo "Modifying $BOARD_CONFIG_PATH to enable I2SIn..."
-          sed -i 's/^\(CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*\)0/\11/' "$BOARD_CONFIG_PATH"
-          echo "Contents after modification:"
+          echo "Modifying $BOARD_CONFIG_PATH to enable CIRCUITPY_AUDIOBUSIO_I2S_IN..."
+          if grep -q "CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*0" "$BOARD_CONFIG_PATH"; then
+            sed -i 's/^\(CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*\)0/\11/' "$BOARD_CONFIG_PATH"
+            echo "CIRCUITPY_AUDIOBUSIO_I2S_IN enabled."
+          elif grep -q "CIRCUITPY_AUDIOBUSIO_I2S_IN\s*=\s*1" "$BOARD_CONFIG_PATH"; then
+            echo "CIRCUITPY_AUDIOBUSIO_I2S_IN already enabled."
+          else
+            echo "WARNING: CIRCUITPY_AUDIOBUSIO_I2S_IN setting not found in the expected format in $BOARD_CONFIG_PATH."
+            # Consider adding if missing and critical, e.g.:
+            # echo "CIRCUITPY_AUDIOBUSIO_I2S_IN = 1" >> "$BOARD_CONFIG_PATH"
+            # echo "Appended CIRCUITPY_AUDIOBUSIO_I2S_IN = 1 to $BOARD_CONFIG_PATH"
+          fi
+          echo "Contents of $BOARD_CONFIG_PATH after modification attempt:"
           cat "$BOARD_CONFIG_PATH"
         else
           echo "ERROR: Board config file $BOARD_CONFIG_PATH not found!"
@@ -125,15 +146,23 @@ jobs:
       working-directory: ${{ github.workspace }}/ports/espressif
       run: |
         echo "Installing ESP-IDF tools for target esp32s3 using submodule's install.sh..."
-        # The esp-idf/install.sh script itself might download more tools.
-        # Ensure the container has enough space for these too.
-        ./esp-idf/install.sh esp32s3
+        if [ -d "./esp-idf" ] && [ -f "./esp-idf/install.sh" ]; then
+          ./esp-idf/install.sh esp32s3 # Specify all targets you might need, or list them e.g. esp32s3,esp32c3
+        else
+          echo "ERROR: esp-idf submodule or install.sh not found. Submodule update might have failed or paths are incorrect."
+          exit 1
+        fi
 
     - name: Build Firmware
       working-directory: ${{ github.workspace }}/ports/espressif
       run: |
         echo "Sourcing ESP-IDF environment and building for board: ${{ steps.board_info.outputs.name }}"
-        source ./esp-idf/export.sh
+        if [ -f "./esp-idf/export.sh" ]; then
+          source ./esp-idf/export.sh
+        else
+          echo "ERROR: esp-idf/export.sh not found. ESP-IDF setup might be incomplete."
+          exit 1
+        fi
         make BOARD=${{ steps.board_info.outputs.name }} -j$(nproc)
 
     - name: Upload Firmware Artifacts (BIN only)
